@@ -1,0 +1,14 @@
+# targets.conf — one line per target, columns separated by whitespace:
+#
+#   <name>   <video-device>   <hid-device>   [label]
+#
+# Blank lines and lines starting with # are ignored. The first target
+# listed is the default. Devices are written as host paths, using their
+# by-path / by-id names. The label is optional and may contain spaces.
+#
+# Copy this file to targets.conf in this directory before editing it.
+# Full documentation of the format: README.md
+#
+# name       video device                                                     hid device                                                                        label
+workstation  /dev/v4l/by-path/platform-xhci-hcd.1-usb-0:1.4:1.0-video-index0  /dev/serial/by-id/usb-1a86_USB_Serial-if00-port0                                  Workstation
+nas          /dev/v4l/by-path/platform-xhci-hcd.1-usb-0:1.3:1.0-video-index0  /dev/serial/by-id/usb-Prolific_Technology_Inc._USB-Serial_Controller-if00-port0   NAS

@@ -1,0 +1,14 @@
+[Unit]
+Description=PiKVM container: switch to target %i
+# Runs in its own cgroup, separate from kvmd.service. kvmd.service uses
+# KillMode=mixed, so once its main + control processes exit it jumps
+# straight to SIGKILL-ing the whole cgroup with no grace period — if the
+# switch ran as a child of kvmd and called `systemctl restart kvmd`
+# synchronously, that call would kill the child before the restart it
+# triggered could finish.
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/pikvm-switch %i
+StandardOutput=journal+console
+StandardError=journal+console

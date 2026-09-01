@@ -1,0 +1,144 @@
+#!/usr/bin/python3
+"""pikvm-switch <name>
+
+Re-points /dev/kvmd-video and /dev/kvmd-hid at a different target and
+restarts kvmd.service. Always runs as its own systemd unit,
+pikvm-switch@<name>.service, rather than in-process from kvmd, because
+kvmd.service's KillMode=mixed would kill a `systemctl restart kvmd` call
+made synchronously from inside kvmd's own cgroup (full reasoning:
+pikvm-switch@.service).
+
+Uses only the standard library. Depends on no kvmd module and no
+pyserial.
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import termios
+import time
+
+# /usr/local/bin is not on sys.path, so the shared module lives in a lib
+# directory that is added explicitly.
+sys.path.insert(0, "/usr/local/lib/pikvm-container")
+
+from pikvm_targets import (
+    KVMD_HID_LINK,
+    KVMD_VIDEO_LINK,
+    PREFIX,
+    TARGETS_CONF,
+    die,
+    force_symlink,
+    log_err,
+    log_info,
+    log_warn,
+    parse_targets_conf,
+    read_current_target,
+    verify_target,
+    write_current_target,
+)
+
+
+# ch9329 holds /dev/kvmd-hid's fd open for as long as its connection loop
+# runs, so re-pointing the symlink alone doesn't retarget it — kvmd itself
+# has to be restarted (full reasoning: 10-container.yaml). A failure here
+# is not fatal, by design — only ever logged as a warning.
+#
+# Uses termios/tty from the standard library to set 9600 8N1, rather than
+# pyserial.
+
+def ch9329_reset(path: str) -> bytes:
+    fd = os.open(path, os.O_RDWR | os.O_NOCTTY)
+    try:
+        cc = list(termios.tcgetattr(fd)[6])
+        cc[termios.VMIN] = 0
+        cc[termios.VTIME] = 10  # 1.0 seconds (unit is 0.1s)
+
+        iflag = 0
+        oflag = 0
+        # CREAD: enable receiver, CLOCAL: ignore modem control lines (required for USB-serial adapters)
+        cflag = termios.CS8 | termios.CREAD | termios.CLOCAL
+        lflag = 0
+
+        termios.tcsetattr(fd, termios.TCSANOW, [iflag, oflag, cflag, lflag, termios.B9600, termios.B9600, cc])
+
+        payload = bytes([0x57, 0xAB, 0x00, 0x0F, 0x00])
+        checksum = sum(payload) % 256
+        frame = payload + bytes([checksum])
+
+        os.write(fd, frame)
+        return os.read(fd, 64)
+    finally:
+        os.close(fd)
+
+
+def restart_kvmd() -> None:
+    subprocess.run(["/usr/bin/systemctl", "restart", "kvmd.service"], check=True)
+
+
+def switch_main(target_name: str) -> None:
+    started_at = time.monotonic()
+
+    targets = parse_targets_conf(TARGETS_CONF)
+    names = [t.name for t in targets]
+    if target_name not in names:
+        die(
+            f"target {target_name!r} is not defined in {TARGETS_CONF} "
+            f"(defined: {', '.join(names)})"
+        )
+
+    current = read_current_target()
+    current_display = current if current is not None else "(unset)"
+
+    if current == target_name:
+        log_info(f"target {target_name!r} is already the current target. Nothing to do.")
+        return
+
+    # kvmd crash-loops on an unopenable device (full reasoning:
+    # kvmd.service.d/10-container.conf), so nothing changes until this
+    # passes.
+    vt = verify_target(target_name)
+
+    if not vt.usable:
+        log_err(f"cannot open the device(s) for switch target {target_name!r}. Exiting without changing anything.")
+        log_err(f"  video: {vt.video_link}: {vt.video_reason}")
+        log_err(f"  hid  : {vt.hid_link}: {vt.hid_reason}")
+        sys.exit(1)
+
+    log_info(f"switching: {current_display!r} -> {target_name!r}")
+
+    # Verification passed — state changes start here.
+    write_current_target(target_name)
+    force_symlink(vt.video_link, KVMD_VIDEO_LINK)
+    force_symlink(vt.hid_link, KVMD_HID_LINK)
+    log_info(f"pointed {KVMD_VIDEO_LINK} / {KVMD_HID_LINK} at {target_name!r}")
+
+    log_info("restarting kvmd.service")
+    try:
+        restart_kvmd()
+    except subprocess.CalledProcessError as e:
+        die(
+            f"systemctl restart kvmd.service failed (returncode={e.returncode}). "
+            f"The device symlinks and the state file were already updated."
+        )
+
+    try:
+        reply = ch9329_reset(KVMD_HID_LINK)
+        log_info(f"sent the CH9329 reset command. reply: {reply.hex()}")
+    except Exception as e:  # pylint: disable=broad-except
+        log_warn(f"CH9329 reset failed (not fatal, continuing): {e}")
+
+    elapsed = time.monotonic() - started_at
+    log_info(f"switch complete: {current_display!r} -> {target_name!r} ({elapsed:.1f}s elapsed)")
+
+
+def main() -> None:
+    if len(sys.argv) != 2:
+        die(f"usage: {PREFIX} <target-name>")
+    switch_main(sys.argv[1])
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,36 @@
+# override.yaml — this deployment's kvmd settings.
+#
+# Copy to override.yaml, edit, then `docker compose restart`. No rebuild.
+# An empty file is valid; start from that if you have nothing to change.
+# What can go in it: https://docs.pikvm.org/config/
+#
+# The container sees the host's /dev as /hostdev, so host devices are
+# named with that prefix here.
+#
+# ATX power control (the gpiochip's major number also has to be allowed in
+# compose.yml; see README.md):
+#
+# kvmd:
+#     atx:
+#         type: gpio
+#         device: /hostdev/gpiochip0
+#
+# Your own buttons in the web UI: a channel under gpio, and a row for it
+# under gpio.view.table. The target buttons are added above your rows.
+#
+# kvmd:
+#     gpio:
+#         drivers:
+#             wol_workstation:
+#                 type: wol
+#                 mac: ff:ff:ff:ff:ff:f1
+#         scheme:
+#             b_wol:
+#                 driver: wol_workstation
+#                 pin: 0
+#                 mode: output
+#                 switch: false
+#         view:
+#             table:
+#                 - ["#Power"]
+#                 - ["b_wol|Wake workstation"]

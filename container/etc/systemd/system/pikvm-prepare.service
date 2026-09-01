@@ -1,0 +1,16 @@
+[Unit]
+Description=PiKVM container: prepare and verify target devices before kvmd starts
+# Finishes before kvmd.service to avoid kvmd's crash-loop failure mode on
+# missing devices (full reasoning: kvmd.service.d/10-container.conf, which
+# also holds the actual Requires= enforcing this).
+Before=kvmd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/pikvm-prepare
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

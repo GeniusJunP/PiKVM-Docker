@@ -1,0 +1,476 @@
+#!/usr/bin/python3
+"""pikvm-prepare
+
+Runs once at container startup (pikvm-prepare.service, before
+kvmd.service): verifies every target's video and HID device actually
+opens, symlinks /dev/kvmd-video and /dev/kvmd-hid at the first usable
+one, records that choice, and writes the settings kvmd reads, adding one
+switch button per target to the operator's own.
+
+Depends on no kvmd module and no pyserial. PyYAML is the only
+non-standard-library import, and it is already in the image because
+kvmd itself uses it.
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+import sys
+
+import yaml
+
+# /usr/local/bin is not on sys.path, so the shared module lives in a lib
+# directory that is added explicitly.
+sys.path.insert(0, "/usr/local/lib/pikvm-container")
+
+from pikvm_targets import (
+    HOSTDEV_DIR,
+    KVMD_HID_LINK,
+    KVMD_VIDEO_LINK,
+    STATE_DIR,
+    TARGETS_CONF,
+    TARGETS_DIR,
+    Target,
+    VerifiedTarget,
+    atomic_write,
+    die,
+    errno_name,
+    force_symlink,
+    host_path_to_container,
+    log_info,
+    log_warn,
+    parse_targets_conf,
+    read_current_target,
+    verify_target,
+    write_current_target,
+)
+
+
+# The operator's own kvmd settings, and the file kvmd actually reads. The
+# second is generated from the first on every start, with one button per
+# target added.
+#
+# kvmd would read the operator's file directly if it were symlinked here,
+# and the target buttons could go in an override.d/ drop-in instead. That
+# does not work for the view: kvmd's config merge recurses into
+# dictionaries but assigns anything else outright
+# (https://github.com/pikvm/kvmd/blob/v4.213/kvmd/yamlconf/merger.py#L38-L44),
+# and view.table is a list, so whichever layer is read last wins the whole
+# table. Combining the two here is what lets both sets of rows exist.
+OVERRIDE_SRC = "/etc/pikvm-container/override.yaml"
+OVERRIDE_FILE = "/etc/kvmd/override.yaml"
+
+GROUP_FILE = "/etc/group"
+
+# kvmd's auth files live under /etc/kvmd upstream, which this container takes
+# fresh from the image on every recreate. 10-container.yaml points kvmd at
+# these copies in the state volume instead, and the image's originals are the
+# seed for a deployment that has none yet.
+SEEDED_FILES = (
+    ("/etc/kvmd/htpasswd", os.path.join(STATE_DIR, "htpasswd")),
+    ("/etc/kvmd/totp.secret", os.path.join(STATE_DIR, "totp.secret")),
+)
+KVMD_USER = "kvmd"  # kvmd.service's User=
+
+
+# The ugpio config schema below was confirmed against the actual upstream
+# source:
+#   - kvmd/apps/_scheme.py's patch_dynamic() builds the gpio driver/scheme
+#     sections at runtime from each driver class's get_plugin_options() /
+#     get_modes() / get_pin_validator()
+#     (https://github.com/pikvm/kvmd/blob/v4.213/kvmd/apps/_scheme.py#L163).
+#   - The cmd driver (kvmd/plugins/ugpio/cmd.py) only takes a cmd option,
+#     and an empty list is rejected by validators/os.py's valid_command
+#     (https://github.com/pikvm/kvmd/blob/v4.213/kvmd/plugins/ugpio/cmd.py#L58,
+#      https://github.com/pikvm/kvmd/blob/v4.213/kvmd/validators/os.py#L108-L114).
+#     The cmd driver only supports output mode, and its pin validator is
+#     str
+#     (https://github.com/pikvm/kvmd/blob/v4.213/kvmd/plugins/ugpio/cmd.py#L61-L67).
+#     It runs the command only when write(pin, True) is called — state=False
+#     does nothing
+#     (https://github.com/pikvm/kvmd/blob/v4.213/kvmd/plugins/ugpio/cmd.py#L73-L76)
+#     — so on the scheme side, leaving switch: false and pulse at its
+#     default (delay=0.1) is enough to make this a "press it, it runs a
+#     command once" button in the WebUI.
+#   - view.table is a 2D array of strings
+#     (validators/ugpio.py's valid_ugpio_view_table,
+#      https://github.com/pikvm/kvmd/blob/v4.213/kvmd/validators/ugpio.py#L59).
+
+def _submap(node: dict, key: str, where: str) -> dict:
+    """setdefault for a nested mapping, refusing rather than crashing when
+    the operator wrote something else at that key."""
+    value = node.setdefault(key, {})
+    if not isinstance(value, dict):
+        die(f"{OVERRIDE_SRC}: {where} must be a mapping, not {type(value).__name__}")
+    return value
+
+
+def build_override(root: dict, targets: list[Target]) -> dict:
+    """Adds one channel and one view row per target to the operator's own
+    settings, and returns the result for kvmd to read.
+
+    Channels are merged into whatever the operator defined, and the target
+    rows are put above theirs rather than in place of them."""
+    gpio = _submap(_submap(root, "kvmd", "kvmd"), "gpio", "kvmd.gpio")
+    drivers = _submap(gpio, "drivers", "kvmd.gpio.drivers")
+    scheme = _submap(gpio, "scheme", "kvmd.gpio.scheme")
+    view = _submap(gpio, "view", "kvmd.gpio.view")
+
+    for t in targets:
+        for (section, name, where) in (
+            (drivers, f"t_{t.name}", "kvmd.gpio.drivers"),
+            (scheme, f"b_{t.name}", "kvmd.gpio.scheme"),
+        ):
+            if name in section:
+                die(
+                    f"{OVERRIDE_SRC}: {where}.{name} is already defined, and "
+                    f"target {t.name!r} needs that name. Rename one of them."
+                )
+
+    for t in targets:
+        drivers[f"t_{t.name}"] = {
+            "type": "cmd",
+            "cmd": [
+                "/usr/bin/sudo", "--non-interactive",
+                "/usr/bin/systemctl", "start", "--no-block",
+                f"pikvm-switch@{t.name}.service",
+            ],
+        }
+        scheme[f"b_{t.name}"] = {
+            "driver": f"t_{t.name}",
+            # A string, not 0: the cmd driver's pin validator is str
+            # (https://github.com/pikvm/kvmd/blob/v4.213/kvmd/plugins/ugpio/cmd.py#L61-L67).
+            "pin": "0",
+            "mode": "output",
+            "switch": False,
+        }
+
+    own_rows = view.setdefault("table", [])
+    if not isinstance(own_rows, list):
+        die(f"{OVERRIDE_SRC}: kvmd.gpio.view.table must be a list, not {type(own_rows).__name__}")
+
+    # The view title is left alone. This is the only user-GPIO surface kvmd
+    # has, and switching targets is not the only thing worth putting on it,
+    # so the targets take a section of the view rather than the whole of it.
+    target_rows: list[list[str]] = [["#Targets"]]
+    for t in targets:
+        target_rows.append([f"b_{t.name}|{t.label}"])
+    if own_rows:
+        # An empty row is not blank space: it closes the current table and
+        # opens another
+        # (https://github.com/pikvm/kvmd/blob/v4.213/web/share/js/kvm/gpio.js#L104-L117).
+        # Columns are per-table, so without this a row of the operator's with
+        # several cells would be laid out against these one-cell rows.
+        target_rows.append([])
+    view["table"] = target_rows + own_rows
+
+    log_info(
+        f"built kvmd's GPIO view: {len(targets)} target button(s) above "
+        f"{len(own_rows)} row(s) from {OVERRIDE_SRC}"
+    )
+    return root
+
+
+def render_override(root: dict) -> str:
+    # This file is what an operator reads when the settings that reached kvmd
+    # are in question, so it is dumped to be read: default_flow_style=None
+    # keeps leaf lists on one line (a view row, a command), width stops a long
+    # by-path device name being folded across several, and allow_unicode
+    # leaves a label as its own text rather than \\uXXXX escapes.
+    body = yaml.safe_dump(
+        root,
+        allow_unicode=True,
+        sort_keys=False,
+        default_flow_style=None,
+        indent=4,
+        width=4096,
+    )
+    return (
+        f"# Generated by pikvm-prepare on every start, from {OVERRIDE_SRC}\n"
+        f"# plus one button per target. Edit that file, not this one.\n"
+        f"{body}"
+    )
+
+
+def seed_persistent_file(src: str, dst: str) -> None:
+    """Copies an image-provided file into the state volume once, and leaves
+    it alone from then on. The file has to exist even when it is empty:
+    kvmd opens the TOTP secret unconditionally whenever its configured path
+    is non-empty
+    (https://github.com/pikvm/kvmd/blob/v4.213/kvmd/apps/kvmd/auth.py#L137-L139),
+    so a missing one would raise on every login attempt."""
+    if os.path.exists(dst):
+        return
+
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    try:
+        if os.path.exists(src):
+            shutil.copyfile(src, dst)
+            st = os.stat(src)
+            os.chmod(dst, st.st_mode & 0o7777)
+            os.chown(dst, st.st_uid, st.st_gid)
+            log_info(f"seeded {dst} from the image's {src}")
+        else:
+            open(dst, "w", encoding="utf-8").close()
+            os.chmod(dst, 0o640)
+            log_warn(
+                f"the image has no {src}; created an empty {dst}. "
+                f"kvmd reads an empty file as 'not configured'."
+            )
+    except OSError as e:
+        die(f"failed to seed {dst}: {errno_name(e)}: {e.strerror}")
+
+
+def load_override(path: str) -> dict:
+    """Parses the operator's kvmd settings. An absent or empty file is a
+    deployment that changes nothing, which is valid."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            root = yaml.safe_load(f)
+    except FileNotFoundError:
+        return {}
+    except OSError as e:
+        die(f"failed to read {path}: {errno_name(e)}: {e.strerror}")
+    except UnicodeDecodeError as e:
+        die(f"{path} is not valid UTF-8 (byte {e.start}); save it as UTF-8")
+    except yaml.YAMLError as e:
+        # kvmd would fail on the same file, but only after this script has
+        # copied it forward, and its error would name the generated file.
+        die(f"{path} is not valid YAML: {e}")
+
+    if root is None:
+        return {}
+    if not isinstance(root, dict):
+        die(f"{path} must be a mapping at the top level, not {type(root).__name__}")
+    return root
+
+
+def find_hostdev_paths(root: dict) -> list[str]:
+    """Collects every /hostdev path named anywhere in the operator's
+    settings.
+
+    kvmd opens the devices its own settings point at -- the gpiochip
+    behind ATX, for one -- and those are not in targets.conf, so
+    grant_device_groups would otherwise never see them. Reading them back
+    out of the settings is what lets the operator name each device once, in
+    the place kvmd needs it, instead of repeating the path somewhere this
+    script can find it.
+    """
+    found: list[str] = []
+    prefix = HOSTDEV_DIR + "/"
+
+    def walk(node: object) -> None:
+        if isinstance(node, dict):
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+        elif isinstance(node, str) and node.startswith(prefix) and node not in found:
+            found.append(node)
+
+    walk(root)
+    return found
+
+
+def grant_device_groups(device_paths: list[str]) -> None:
+    """Puts the GIDs owning the host's devices into the container's
+    /etc/group, as groups the kvmd user belongs to.
+
+    systemd calls initgroups() for every unit whose User= is a non-root
+    user, replacing the supplementary groups inherited from PID 1 with
+    the ones NSS reports for that user
+    (https://github.com/systemd/systemd/blob/v257/src/core/exec-invoke.c#L903-L916).
+    docker's group_add applies to PID 1, so its GIDs never survive into
+    kvmd.service; they have to be in the container's own /etc/group.
+    /etc/group is in the writable layer, so this is redone every start.
+    """
+    gids: set[int] = set()
+    for path in device_paths:
+        try:
+            gid = os.stat(path).st_gid
+        except OSError as e:
+            log_warn(f"cannot stat {path} for its group: {errno_name(e)}: {e.strerror}")
+            continue
+        if gid == 0:
+            # Granting the root group would hand kvmd every file in the
+            # container that group root can reach, which is far more than
+            # this one device. Give the device its own group on the host
+            # (a udev rule) rather than widening kvmd here.
+            log_warn(
+                f"{path} is owned by group root (gid 0); refusing to add "
+                f"{KVMD_USER!r} to the root group. kvmd will not be able to "
+                f"open it until the host gives the device a non-root group."
+            )
+            continue
+        gids.add(gid)
+
+    try:
+        with open(GROUP_FILE, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError as e:
+        die(f"failed to read {GROUP_FILE}: {errno_name(e)}: {e.strerror}")
+
+    def already_granted(gid: int) -> bool:
+        for line in lines:
+            cols = line.split(":")
+            if len(cols) == 4 and cols[2] == str(gid):
+                if KVMD_USER in (m for m in cols[3].split(",") if m):
+                    return True
+        return False
+
+    # A new entry rather than an edit to whichever group already sits on
+    # that GID: the image's group at, say, gid 20 means something else
+    # than the host's (utmp vs dialout, for instance), and permission
+    # checks look at the number, not the name. Duplicate GIDs in
+    # /etc/group are allowed, so this grants exactly the number needed
+    # without rewriting an unrelated group's membership.
+    changed = False
+    for gid in sorted(gids):
+        if already_granted(gid):
+            continue
+        name = f"pikvm-dev{gid}"
+        lines.append(f"{name}:x:{gid}:{KVMD_USER}")
+        log_info(f"granted {KVMD_USER!r} gid {gid} as group {name!r}")
+        changed = True
+
+    if changed:
+        atomic_write(GROUP_FILE, "\n".join(lines) + "\n")
+    elif gids:
+        log_info(f"{KVMD_USER!r} already has every device group; {GROUP_FILE} unchanged")
+    else:
+        log_info(f"no device group could be read; {GROUP_FILE} unchanged")
+
+
+def prepare_main() -> None:
+    log_info(f"reading targets.conf: {TARGETS_CONF}")
+    targets = parse_targets_conf(TARGETS_CONF)
+    log_info(f"found {len(targets)} target(s): " + ", ".join(t.name for t in targets))
+
+    if not os.path.ismount(HOSTDEV_DIR):
+        die(
+            f"{HOSTDEV_DIR} is not mounted. Either the volumes config that "
+            f"bind-mounts the host's /dev read-only into the container's "
+            f"{HOSTDEV_DIR} is missing, or it has come undone."
+        )
+
+    os.makedirs(TARGETS_DIR, exist_ok=True)
+
+    verified: list[VerifiedTarget] = []
+
+    for t in targets:
+        video_link = os.path.join(TARGETS_DIR, f"{t.name}-video")
+        hid_link = os.path.join(TARGETS_DIR, f"{t.name}-hid")
+        force_symlink(host_path_to_container(t.video_host), video_link)
+        force_symlink(host_path_to_container(t.hid_host), hid_link)
+
+        # kvmd crash-loops on an unopenable device (full reasoning:
+        # kvmd.service.d/10-container.conf), so nothing changes until
+        # this passes.
+        vt = verify_target(t.name)
+        verified.append(vt)
+
+        log_info(f"target {t.name!r}: {'usable' if vt.usable else 'not usable'}")
+        log_info(f"  video: {t.video_host} ({vt.video_link}): {vt.video_reason}")
+        log_info(f"  hid  : {t.hid_host} ({vt.hid_link}): {vt.hid_reason}")
+        if not vt.usable:
+            log_info(
+                "  check that both paths exist on the host: "
+                "ls -l /dev/v4l/by-path/ and ls -l /dev/serial/by-id/"
+            )
+
+    # docker compose restart doesn't recreate the tmpfs /dev, so a target
+    # removed from targets.conf since the last start would otherwise leave
+    # its symlinks behind indefinitely.
+    configured_names = {t.name for t in targets}
+    for entry in sorted(os.listdir(TARGETS_DIR)):
+        if entry.endswith("-video"):
+            name = entry[: -len("-video")]
+        elif entry.endswith("-hid"):
+            name = entry[: -len("-hid")]
+        else:
+            continue
+        if name in configured_names:
+            continue
+        stale_path = os.path.join(TARGETS_DIR, entry)
+        try:
+            os.remove(stale_path)
+        except OSError as e:
+            die(f"failed to remove stale target link {stale_path}: {errno_name(e)}: {e.strerror}")
+        log_info(f"removed stale target link {stale_path} (target {name!r} no longer in targets.conf)")
+
+    for (src, dst) in SEEDED_FILES:
+        seed_persistent_file(src, dst)
+
+    override = load_override(OVERRIDE_SRC)
+
+    device_paths = [vt.video_link for vt in verified] + [vt.hid_link for vt in verified]
+    for path in find_hostdev_paths(override):
+        log_info(f"{OVERRIDE_SRC} names host device {path}")
+        device_paths.append(path)
+    grant_device_groups(device_paths)
+
+    remembered = read_current_target()
+    chosen: "str | None" = None
+
+    remembered_vt: "VerifiedTarget | None" = None
+    if remembered is not None:
+        for vt in verified:
+            if vt.name == remembered:
+                remembered_vt = vt
+                break
+
+    if remembered is None:
+        log_info("no remembered target (current-target) found")
+    elif remembered_vt is None:
+        log_warn(f"remembered target {remembered!r} is not in the current targets.conf")
+    elif not remembered_vt.usable:
+        log_warn(f"remembered target {remembered!r} failed verification")
+    else:
+        chosen = remembered
+
+    if chosen is not None:
+        log_info(f"using remembered target {chosen!r} (verified OK)")
+    else:
+        for vt in verified:
+            if vt.usable:
+                chosen = vt.name
+                break
+        if chosen is not None:
+            if remembered is None:
+                log_info(f"using {chosen!r} as the default target (first entry in targets.conf that verified OK)")
+            else:
+                log_warn(
+                    f"falling back to {chosen!r}, the first target that verified OK "
+                    f"(remembered target was {remembered!r})"
+                )
+
+    if chosen is None:
+        die(
+            f"no target could be verified, so kvmd was not started. Check that "
+            f"the device paths in {TARGETS_CONF} match what is present on the host."
+        )
+
+    force_symlink(os.path.join(TARGETS_DIR, f"{chosen}-video"), KVMD_VIDEO_LINK)
+    force_symlink(os.path.join(TARGETS_DIR, f"{chosen}-hid"), KVMD_HID_LINK)
+    log_info(f"pointed {KVMD_VIDEO_LINK} / {KVMD_HID_LINK} at {chosen!r}")
+
+    # Recorded so a later switch back to this exact target isn't refused
+    # as "already current" against a stale or never-written state file.
+    write_current_target(chosen)
+
+    atomic_write(OVERRIDE_FILE, render_override(build_override(override, targets)))
+    log_info(f"generated {OVERRIDE_FILE}")
+
+    log_info("preparation complete. kvmd.service is now allowed to start.")
+
+
+def main() -> None:
+    if len(sys.argv) != 1:
+        die("usage: pikvm-prepare")
+    prepare_main()
+
+
+if __name__ == "__main__":
+    main()
