@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.DS_Store
+config/targets.conf
+config/override.yaml
+config/gpio-extra.conf
