@@ -1,0 +1,32 @@
+# compose.otg.yml — OTG overlay.
+#
+# Adds a USB mass-storage gadget, so a disk image can be shown to the
+# target as a USB drive, at the cost of running the container privileged:
+#
+#   docker compose -f compose.yml -f compose.otg.yml up -d
+#
+# Privileged because kvmd-otg assembles the gadget by writing to configfs
+# while it runs, and configfs needs CAP_SYS_ADMIN.
+#
+# Keyboard and mouse keep going through the CH9329 adapter here. kvmd only
+# builds HID gadget functions when kvmd.hid.type is otg
+# (https://github.com/pikvm/kvmd/blob/v4.213/kvmd/apps/otg/__init__.py#L419),
+# and 10-container.yaml leaves it at ch9329, so this gadget carries mass
+# storage only.
+#
+# Only ONE target can use OTG at a time: the Pi has one USB Device
+# Controller, and the gadget is bound to it regardless of which target's
+# cable is plugged in.
+
+services:
+  pikvm:
+    privileged: true
+
+    volumes:
+      # configfs, so kvmd-otg can build the gadget; needs CONFIG_CONFIGFS_FS
+      # mounted here (default on Raspberry Pi OS/Debian/Ubuntu/Arch).
+      - /sys/kernel/config:/sys/kernel/config
+
+    # Image is built unprivileged (Dockerfile masks kvmd-otg, sets
+    # msd: disabled); pikvm-otg-boot undoes both, then execs systemd.
+    command: ["/usr/local/bin/pikvm-otg-boot"]

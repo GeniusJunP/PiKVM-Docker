@@ -1,0 +1,31 @@
+#!/bin/sh
+#
+# Entry point used only by compose.otg.yml, in place of systemd.
+#
+# The image is built for the unprivileged case: the Dockerfile masks
+# kvmd-otg.service and sets `msd: disabled`, since neither can work
+# without --privileged. This overlay doesn't rebuild the image, so both
+# are undone here before systemd starts and computes its boot transaction.
+
+set -e
+
+# No running manager yet to ask for a reload, so unmask by removing the
+# symlink directly rather than via `systemctl unmask`.
+rm -f /etc/systemd/system/kvmd-otg.service
+systemctl enable kvmd-otg.service
+
+# 20-otg.yaml sorts after the image's 10-container.yaml, so its msd: key
+# wins. /etc/kvmd is not on a volume, so this lives in the container's
+# writable layer and is gone again once the container is recreated without
+# this overlay.
+cat > /etc/kvmd/override.d/20-otg.yaml <<'YAML'
+# Written by pikvm-otg-boot; regenerated every start, and gone when the
+# container is recreated without compose.otg.yml.
+kvmd:
+    msd:
+        type: otg
+YAML
+
+# Replace this shell with systemd so it's PID 1 and receives stop_signal
+# directly, as in compose.yml.
+exec /usr/lib/systemd/systemd

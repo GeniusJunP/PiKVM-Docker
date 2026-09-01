@@ -1,0 +1,123 @@
+# compose.yml — run pikvm-container unprivileged.
+#
+#   docker compose up -d
+#
+# For OTG mode (privileged), layer compose.otg.yml on top instead:
+#
+#   docker compose -f compose.yml -f compose.otg.yml up -d
+
+services:
+  pikvm:
+    image: pikvm-container:local
+    # So `docker compose up -d --build` covers the image too. build.sh points
+    # pikvm-rootfs:current at whatever it built last, so nothing has to be
+    # copied from its output into here, and moving to another PiKVM release
+    # is build.sh plus a rebuild rather than an edit here.
+    build:
+      context: .
+      args:
+        BASE: pikvm-rootfs:current
+    # This image is only ever built here, never published, so without this
+    # compose tries to pull it first and prints a wall of access-denied
+    # before falling back to the build. It also means `up` alone picks up
+    # changes under container/, with no --build to remember.
+    pull_policy: build
+    container_name: pikvm
+    restart: unless-stopped
+
+    # systemd is PID 1 and stops on SIGRTMIN+3, not SIGTERM; it needs time
+    # to run kvmd's own ExecStopPost=kvmd-cleanup before SIGKILL.
+    stop_signal: SIGRTMIN+3
+    stop_grace_period: 30s
+
+    # tini must not run in front of systemd — systemd has to be PID 1.
+    init: false
+
+    # Without a TTY the runtime creates no /dev/console, and systemd's own
+    # boot messages plus every unit set to StandardOutput=journal+console
+    # have nowhere to go -- docker logs stays empty. This wires them to the
+    # container's stdout.
+    tty: true
+
+    # Runs WITHOUT CAP_SYS_ADMIN, --privileged, or cap_add — checked
+    # against the moby/systemd/runc source.
+    security_opt:
+      # Mounts /sys/fs/cgroup read-write, scoped to this container's own
+      # cgroup namespace (Docker >= 28.0.0, moby PR #48828); without it
+      # systemd can't create the per-unit cgroups it needs.
+      #
+      # Do NOT replace with a `-v /sys/fs/cgroup:/sys/fs/cgroup:rw` bind
+      # mount: that's applied before this container's cgroup namespace
+      # exists, so it hands over the host's whole, unnamespaced cgroup
+      # tree read-write — every other container's cgroup included.
+      - "writable-cgroups=true"
+      # docker-default AppArmor unconditionally denies mount(), blocking
+      # the mount()/unshare(CLONE_NEWNS) calls systemd makes per unit.
+      - "apparmor=unconfined"
+
+    tmpfs:
+      - /run
+      - /run/lock
+      - /tmp
+
+    # What a human writes is bind-mounted read-only, so it stays an editable
+    # file on the host that git and backups can see, and nothing in the
+    # container can rewrite it. What a program writes goes in a named volume,
+    # which nobody edits by hand but which has to outlive the container.
+    volumes:
+      # Whole host /dev, read-only, not per-device passthrough:
+      # --device=/dev/videoX breaks on unplug/replug when the device
+      # number shifts. targets.conf names devices by by-path/by-id
+      # instead, resolved by pikvm-prepare at every startup and by
+      # pikvm-switch at every switch.
+      - /dev:/hostdev:ro
+      # The directory rather than the two files inside it: a bind mount of a
+      # single file follows the inode, and editors write by rename, so the
+      # container would keep reading the file as it was at start with nothing
+      # to say so. A directory's inode survives its contents being replaced.
+      # Holds targets.conf and override.yaml, which pikvm-prepare reads at
+      # every startup. Editing either needs no rebuild -- docker compose
+      # restart is enough.
+      - ./config:/etc/pikvm-container:ro
+      # Only the self-signed cert, not all of /etc/kvmd. A named volume is
+      # seeded from the image once, when it is still empty, and is never
+      # re-synced afterwards -- so a volume covering /etc/kvmd would pin the
+      # whole kvmd configuration tree (main.yaml, nginx/, override.d/) to
+      # whatever the first-ever start wrote, and a rebuilt image's config
+      # would silently never apply. Scoped to ssl/, that same stickiness is
+      # what keeps a browser trusting the cert across rebuilds.
+      - pikvm-ssl:/etc/kvmd/nginx/ssl
+      # Everything else that has to outlive the container: the selected
+      # target, and the auth files 10-container.yaml points here.
+      - pikvm-state:/var/lib/pikvm-container
+
+    # cgroup v2's device allow-list is fixed at container-create time, so
+    # only static major numbers can go here. gpiochip's major is assigned
+    # dynamically by the kernel, so ATX (kvmd's gpio-backed target) stays
+    # disabled unless you look up the current major and add it by hand.
+    device_cgroup_rules:
+      - 'c 81:* rmw'    # video4linux — USB/CSI capture dongles
+      - 'c 166:* rmw'   # ttyACM — USB CDC-ACM serial
+      - 'c 188:* rmw'   # ttyUSB — USB-serial converters (e.g. CH9329, PL2303)
+
+    # No group_add: it would apply to PID 1 (systemd), and systemd calls
+    # initgroups() for every unit whose User= is a non-root user, which
+    # replaces the inherited supplementary groups with the ones NSS
+    # reports inside the container
+    # (https://github.com/systemd/systemd/blob/v257/src/core/exec-invoke.c#L903-L916).
+    # kvmd.service runs as User=kvmd, so nothing set here would reach it.
+    # pikvm-prepare puts the host's device GIDs into the container's
+    # /etc/group instead, reading them off the devices themselves: the
+    # ones targets.conf names, plus every /hostdev path found in
+    # config/override.yaml.
+
+    # Do not add `ipc: host`: ustreamer's /dev/shm sink names are fixed
+    # strings, not namespaced per container — sharing the host IPC
+    # namespace risks colliding with another ustreamer instance.
+
+    ports:
+      - "8443:443"   # maps kvmd-nginx's 443 to 8443
+
+volumes:
+  pikvm-ssl:      # self-signed cert; delete this volume to have a new one issued
+  pikvm-state:    # selected target, htpasswd, TOTP secret

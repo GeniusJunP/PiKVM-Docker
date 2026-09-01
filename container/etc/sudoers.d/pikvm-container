@@ -1,0 +1,11 @@
+# pikvm-container
+#
+# Scoped to the one command kvmd needs
+# which kvmd runs from a GPIO button via
+# kvmd/plugins/ugpio/cmd.py's Plugin.write()
+# (https://github.com/pikvm/kvmd/blob/v4.213/kvmd/plugins/ugpio/cmd.py#L73-L84):
+#   /usr/bin/sudo --non-interactive /usr/bin/systemctl start --no-block pikvm-switch@<name>.service
+#
+# --no-block is required: a synchronous wait would block on kvmd's own
+# restart and the GPIO write() would be treated as a RuntimeError.
+kvmd ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block pikvm-switch@*

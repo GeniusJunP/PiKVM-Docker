@@ -1,0 +1,6 @@
+# Not a mount — this is config that kvmd/fstab.py reads for
+# X-kvmd.otgmsd-root= when MSD storage is enabled
+# (https://github.com/pikvm/kvmd/blob/v4.213/kvmd/plugins/msd/otg/storage.py#L223).
+# Kept even with the default `msd: disabled` so switching to OTG/MSD mode
+# needs no second edit. `noauto` keeps systemd from trying to mount it.
+/var/lib/kvmd/msd  /var/lib/kvmd/msd  none  bind,noauto,X-kvmd.otgmsd-root=/var/lib/kvmd/msd,X-kvmd.otgmsd-user=kvmd  0 0

@@ -1,0 +1,35 @@
+# pikvm-container: kvmd config for the unprivileged container.
+kvmd:
+    hid:
+        # ch9329 opens /dev/kvmd-hid once and holds that fd for as long as
+        # its connection context is active
+        # (https://github.com/pikvm/kvmd/blob/v4.213/kvmd/plugins/hid/ch9329/__init__.py#L194-L195),
+        # so re-pointing the symlink during a target switch does not
+        # retarget an already-open fd — a file descriptor is bound to the
+        # inode it was opened against, not the symlink path used to open
+        # it. POST /hid/reset doesn't reopen the port either: the
+        # chip-reset call it would trigger is commented out upstream
+        # (https://github.com/pikvm/kvmd/blob/v4.213/kvmd/plugins/hid/ch9329/__init__.py#L199).
+        # So pikvm-switch restarts kvmd.service on every switch instead of
+        # relying on the symlink change alone.
+        type: ch9329
+        device: /dev/kvmd-hid
+    atx:
+        # Disabled because gpiochip's device major cannot be pinned in
+        # advance (full reasoning: compose.yml's device_cgroup_rules).
+        type: disabled
+    msd:
+        # MSD needs OTG, which can't work unprivileged — /dev/hidg*'s major
+        # is only assigned after the gadget is assembled via configfs.
+        type: disabled
+    auth:
+        # Moved out of /etc/kvmd, which is not persisted, and into the
+        # state volume. kvmd writes both files itself once a user or a
+        # 2FA secret is added, and they have to survive the container.
+        internal:
+            file: /var/lib/pikvm-container/htpasswd
+        totp:
+            secret:
+                file: /var/lib/pikvm-container/totp.secret
+    streamer:
+        forever: true
