@@ -3,3 +3,4 @@ __pycache__/
 .DS_Store
 config/targets.conf
 config/override.yaml
+data/
